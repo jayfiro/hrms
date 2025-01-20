@@ -711,11 +711,9 @@ class PayrollEntry(Document):
 
 	@frappe.whitelist()
 	def make_payment_entry(self):
+		"""Creates individual bank entries for each employee's salary payment"""
 		self.check_permission("write")
 		self.employee_based_payroll_payable_entries = {}
-		process_payroll_accounting_entry_based_on_employee = frappe.db.get_single_value(
-			"Payroll Settings", "process_payroll_accounting_entry_based_on_employee"
-		)
 
 		salary_slip_name_list = frappe.db.sql(
 			""" select t1.name from `tabSalary Slip` t1
@@ -725,57 +723,120 @@ class PayrollEntry(Document):
 			as_list=True,
 		)
 
-		if salary_slip_name_list and len(salary_slip_name_list) > 0:
-			salary_slip_total = 0
-			for salary_slip_name in salary_slip_name_list:
-				salary_slip = frappe.get_doc("Salary Slip", salary_slip_name[0])
+		if not salary_slip_name_list:
+			frappe.throw(_("No salary slip found to process"))
 
-				for sal_detail in salary_slip.earnings:
-					(
-						is_flexible_benefit,
-						only_tax_impact,
-						creat_separate_je,
-						statistical_component,
-					) = frappe.db.get_value(
-						"Salary Component",
-						sal_detail.salary_component,
-						[
-							"is_flexible_benefit",
-							"only_tax_impact",
-							"create_separate_payment_entry_against_benefit_claim",
-							"statistical_component",
-						],
-					)
-					if only_tax_impact != 1 and statistical_component != 1:
-						if is_flexible_benefit == 1 and creat_separate_je == 1:
-							self.create_journal_entry(sal_detail.amount, sal_detail.salary_component)
-						else:
-							if process_payroll_accounting_entry_based_on_employee:
-								self.set_employee_based_payroll_payable_entries(
-									"earnings",
-									salary_slip.employee,
-									sal_detail.amount,
-									salary_slip.salary_structure,
-								)
-							salary_slip_total += sal_detail.amount
+		# Process each salary slip and create individual journal entries
+		for salary_slip_name in salary_slip_name_list:
+			self.create_individual_journal_entry(salary_slip_name[0])
 
-				for sal_detail in salary_slip.deductions:
-					statistical_component = frappe.db.get_value(
-						"Salary Component", sal_detail.salary_component, "statistical_component"
-					)
-					if statistical_component != 1:
-						if process_payroll_accounting_entry_based_on_employee:
-							self.set_employee_based_payroll_payable_entries(
-								"deductions",
-								salary_slip.employee,
-								sal_detail.amount,
-								salary_slip.salary_structure,
-							)
+	def create_individual_journal_entry(self, salary_slip_name):
+		"""Creates a journal entry for an individual employee's salary payment"""
+		salary_slip = frappe.get_doc("Salary Slip", salary_slip_name)
 
-						salary_slip_total -= sal_detail.amount
+		# Calculate total amount for this employee
+		total_salary = 0
+		for earning in salary_slip.earnings:
+			if not self._is_component_to_exclude(earning.salary_component):
+				total_salary += earning.amount
 
-			if salary_slip_total > 0:
-				self.create_journal_entry(salary_slip_total, "salary")
+		for deduction in salary_slip.deductions:
+			if not self._is_statistical_component(deduction.salary_component):
+				total_salary -= deduction.amount
+
+		if total_salary <= 0:
+			return
+
+		# Prepare journal entry
+		accounts = []
+		currencies = []
+		company_currency = erpnext.get_company_currency(self.company)
+		precision = frappe.get_precision("Journal Entry Account", "debit_in_account_currency")
+		accounting_dimensions = get_accounting_dimensions() or []
+
+		# Add payment account (credit entry)
+		exchange_rate, amount = self.get_amount_and_exchange_rate_for_journal_entry(
+			self.payment_account, total_salary, company_currency, currencies
+		)
+		accounts.append(
+			self.update_accounting_dimensions(
+				{
+					"account": self.payment_account,
+					"bank_account": self.bank_account,
+					"credit_in_account_currency": flt(amount, precision),
+					"exchange_rate": flt(exchange_rate),
+					"cost_center": self.cost_center,
+				},
+				accounting_dimensions,
+			)
+		)
+
+		# Add payroll payable account (debit entry)
+		cost_centers = self.get_payroll_cost_centers_for_employee(
+			salary_slip.employee, salary_slip.salary_structure
+		)
+
+		for cost_center, percentage in cost_centers.items():
+			amount_against_cost_center = flt(amount) * percentage / 100
+			accounts.append(
+				self.update_accounting_dimensions(
+					{
+						"account": self.payroll_payable_account,
+						"debit_in_account_currency": flt(amount_against_cost_center, precision),
+						"exchange_rate": flt(exchange_rate),
+						"reference_type": self.doctype,
+						"reference_name": self.name,
+						"party_type": "Employee",
+						"party": salary_slip.employee,
+						"cost_center": cost_center,
+					},
+					accounting_dimensions,
+				)
+			)
+
+		# Create journal entry
+		journal_entry = frappe.new_doc("Journal Entry")
+		journal_entry.voucher_type = "Bank Entry"
+		journal_entry.user_remark = _("Payment for {0} from {1} to {2} for employee {3} - {4}").format(
+			"salary",
+			self.start_date,
+			self.end_date,
+			salary_slip.employee,
+			salary_slip.employee_name
+		)
+		journal_entry.company = self.company
+		journal_entry.posting_date = self.posting_date
+		journal_entry.multi_currency = 1 if len(currencies) > 1 else 0
+
+		journal_entry.set("accounts", accounts)
+		journal_entry.save(ignore_permissions=True)
+
+	def _is_component_to_exclude(self, salary_component):
+		"""Check if the salary component should be excluded from the bank entry"""
+		is_flexible_benefit, only_tax_impact, create_separate_payment, statistical_component = frappe.db.get_value(
+			"Salary Component",
+			salary_component,
+			[
+				"is_flexible_benefit",
+				"only_tax_impact",
+				"create_separate_payment_entry_against_benefit_claim",
+				"statistical_component",
+			],
+		)
+
+		return (
+				(is_flexible_benefit and create_separate_payment) or
+				only_tax_impact or
+				statistical_component
+		)
+
+	def _is_statistical_component(self, salary_component):
+		"""Check if the component is statistical"""
+		return frappe.db.get_value(
+			"Salary Component",
+			salary_component,
+			"statistical_component"
+		)
 
 	def create_journal_entry(self, je_payment_amount, user_remark):
 		payroll_payable_account = self.payroll_payable_account
